@@ -1,0 +1,48 @@
+// Copyright © Tasuku Suzuki <tasuku.suzuki@slint.dev>
+// SPDX-License-Identifier: MIT
+
+import "./fonts/NotoSansMono-Regular.ttf";
+import { Button, VerticalBox } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    width: 320px;
+    height: 240px;
+    title: "Three Minutes Challenge";
+    default-font-family: "Noto Sans Mono";
+    default-font-size: 32px;
+
+    in-out property <bool> running: false;
+    in-out property<int> min: 0;
+    in-out property<int> sec: 0;
+    in-out property<string> time: "0:00";
+    callback reset-clicked <=> reset.clicked;
+    callback button-clicked <=> button.clicked;
+
+    VerticalBox {
+        reset := Button { 
+            text: "Reset";
+            enabled: !root.running && (root.min > 0 || root.sec > 0);
+        }
+        clock := Text {
+            text: root.time;
+            font-size: 64px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+        }
+        button := Button {
+            text: "Start"; 
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            primary: true;
+            enabled: min < 3;
+        }
+    }
+
+    states [
+        active when running: {
+            button.text: "Stop";
+        }
+    ]
+}
