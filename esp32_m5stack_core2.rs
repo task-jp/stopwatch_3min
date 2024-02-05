@@ -6,9 +6,12 @@ use dummy_pin::DummyPin;
 use embedded_graphics_core::geometry::OriginDimensions;
 use embedded_hal::digital::v2::OutputPin;
 use esp32_hal::{
-    clock::{ClockControl, CpuClock},
+    clock::ClockControl,
+    dma::DmaPriority,
     i2c::I2C,
+    i2s::{DataFormat, I2s, I2s0New, I2sWriteDma, NoMclk, PinsBclkWsDout, Standard},
     interrupt::{self, Priority},
+    pdma::Dma,
     peripherals::{self, Peripherals, TIMG0},
     prelude::*,
     spi::{master::Spi, SpiMode},
@@ -24,18 +27,36 @@ pub use xtensa_lx_rt::entry;
 
 use critical_section::Mutex;
 static TIMER00: Mutex<RefCell<Option<Timer<Timer0<TIMG0>>>>> = Mutex::new(RefCell::new(None));
+static mut BEEP_COUNTER: u32 = 0;
 static mut SYSTEM_COUNTER: u64 = 0;
+
+const SINE: [i16; 64] = [
+    0, 3211, 6392, 9511, 12539, 15446, 18204, 20787, 23169, 25329, 27244, 28897, 30272, 31356,
+    32137, 32609, 32767, 32609, 32137, 31356, 30272, 28897, 27244, 25329, 23169, 20787, 18204,
+    15446, 12539, 9511, 6392, 3211, 0, -3211, -6392, -9511, -12539, -15446, -18204, -20787, -23169,
+    -25329, -27244, -28897, -30272, -31356, -32137, -32609, -32767, -32609, -32137, -31356, -30272,
+    -28897, -27244, -25329, -23169, -20787, -18204, -15446, -12539, -9511, -6392, -3211,
+];
 
 #[global_allocator]
 static ALLOCATOR: EspHeap = EspHeap::empty();
 
 pub fn init() {
-    const HEAP_SIZE: usize = 150 * 1024; // 150KB, original for CoreS3 is 200KB
+    const HEAP_SIZE: usize = 100 * 1024; // 100KB, original for CoreS3 is 200KB
     static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
     unsafe { ALLOCATOR.init(&mut HEAP as *mut u8, core::mem::size_of_val(&HEAP)) }
     slint::platform::set_platform(Box::new(EspBackend::default()))
         .expect("backend already initialized");
 }
+
+pub fn beep(ms: u32) {
+    let samples = ms * 44100u32 / 1000u32;
+    let samples = samples - samples % SINE.len() as u32;
+    unsafe {
+        core::ptr::write_volatile(&mut BEEP_COUNTER, samples);
+    }
+}
+
 #[interrupt]
 fn TG0_T0_LEVEL() {
     critical_section::with(|cs| {
@@ -75,7 +96,7 @@ impl slint::platform::Platform for EspBackend {
     fn run_event_loop(&self) -> Result<(), slint::PlatformError> {
         let peripherals = Peripherals::take();
         let system = peripherals.SYSTEM.split();
-        let clocks = ClockControl::configure(system.clock_control, CpuClock::Clock240MHz).freeze();
+        let clocks = ClockControl::boot_defaults(system.clock_control).freeze();
 
         let mut rtc = Rtc::new(peripherals.RTC_CNTL);
         let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
@@ -164,7 +185,73 @@ impl slint::platform::Platform for EspBackend {
         let mut last_touch = None;
         let button = slint::platform::PointerEventButton::Left;
 
+        // Sound
+        let dma = Dma::new(system.dma);
+        let dma_channel = dma.i2s0channel;
+
+        let mut tx_descriptors = [0u32; 20 * 3];
+        let mut rx_descriptors = [0u32; 8 * 3];
+
+        let i2s = I2s::new(
+            peripherals.I2S0,
+            NoMclk {},
+            Standard::Philips,
+            DataFormat::Data16Channel16,
+            44100u32.Hz(),
+            dma_channel.configure(
+                false,
+                &mut tx_descriptors,
+                &mut rx_descriptors,
+                DmaPriority::Priority0,
+            ),
+            &clocks,
+        );
+
+        let i2s_tx = i2s.i2s_tx.with_pins(PinsBclkWsDout::new(
+            io.pins.gpio12,
+            io.pins.gpio0,
+            io.pins.gpio2,
+        ));
+
+        let data =
+            unsafe { core::slice::from_raw_parts(&SINE as *const _ as *const u8, SINE.len() * 2) };
+
+        let buffer = dma_buffer();
+        let mut transfer = i2s_tx.write_dma_circular(buffer).unwrap();
+
+        let mut idx = 0;
         loop {
+            let avail = transfer.available();
+            if avail > 0 {
+                let mut filler = [0u8; 10000];
+                let avail = usize::min(10000, avail);
+                let mut beep_counter = unsafe { core::ptr::read_volatile(&mut BEEP_COUNTER) };
+                let beeping = beep_counter > 0;
+                if beeping {
+                    esp_println::println!("avail: {}, beep_counter: {}", avail, beep_counter);
+                }
+                for bidx in 0..avail {
+                    if beep_counter > 0 {
+                        beep_counter -= 1;
+                        filler[bidx] = data[idx];
+                        idx += 1;
+
+                        if idx >= data.len() {
+                            idx = 0;
+                        }
+                    } else {
+                        idx = 0;
+                        filler[bidx] = 0;
+                    }
+                }
+                if beeping {
+                    esp_println::println!("beep_counter: {}", beep_counter);
+                    unsafe {
+                        core::ptr::write_volatile(&mut BEEP_COUNTER, beep_counter);
+                    }
+                }
+                transfer.push(&filler[0..avail]).unwrap();
+            }
             slint::platform::update_timers_and_animations();
             if let Some(window) = self.window.borrow().clone() {
                 touch.get_touch_event().ok().and_then(|touch_event| {
@@ -215,12 +302,7 @@ impl slint::platform::Platform for EspBackend {
                     continue;
                 }
             }
-            // TODO
         }
-    }
-
-    fn debug_log(&self, arguments: core::fmt::Arguments) {
-        esp_println::println!("{}", arguments);
     }
 }
 
@@ -260,4 +342,9 @@ impl<
             )
             .unwrap();
     }
+}
+
+fn dma_buffer() -> &'static mut [u8; 32000] {
+    static mut BUFFER: [u8; 32000] = [0u8; 32000];
+    unsafe { &mut BUFFER }
 }

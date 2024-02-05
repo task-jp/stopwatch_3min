@@ -22,10 +22,12 @@ fn main() -> ! {
         main_window.set_sec(0);
         let time = slint::format!("0:00");
         main_window.set_time(time);
+        beep(100);
     });
 
     let weak = main_window.as_weak();
     main_window.on_button_clicked(move || {
+        beep(100);
         let main_window = weak.upgrade().unwrap();
         let running = main_window.get_running();
         if running {
@@ -51,6 +53,7 @@ fn main() -> ! {
                         min += 1;
                         if min == 3 {
                             main_window.set_running(false);
+                            beep(500);
                         }
                     }
                     main_window.set_min(min);
